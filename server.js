@@ -10,9 +10,25 @@ app.use(express.json());
 
 const sessions = {};
 
+function cleanupSession(id) {
+  if (sessions[id]) {
+    try { sessions[id].sock?.end(); } catch (_) {}
+    delete sessions[id];
+  }
+  try { fs.rmSync(`./auth_${id}`, { recursive: true, force: true }); } catch (_) {}
+}
+
 async function startSession(id) {
   if (sessions[id] && sessions[id].starting) return;
-  sessions[id] = { ready: false, qr: null, starting: true, error: null };
+
+  // تنظيف الجلسات غير المرتبطة لتوفير الذاكرة في Render
+  Object.keys(sessions).forEach((key) => {
+    if (key !== id && !sessions[key].ready && Date.now() - sessions[key].createdAt > 120000) {
+      cleanupSession(key);
+    }
+  });
+
+  sessions[id] = { ready: false, qr: null, starting: true, error: null, createdAt: Date.now() };
 
   try {
     const authFolder = `./auth_${id}`;
@@ -24,19 +40,22 @@ async function startSession(id) {
       auth: state,
       logger: pino({ level: 'silent' }),
       browser: ['Ubuntu', 'Chrome', '20.0.04'],
-      syncFullHistory: false
+      syncFullHistory: false,
+      connectTimeoutMs: 30000
     });
 
     sessions[id].sock = sock;
-
     sock.ev.on('creds.update', saveCreds);
 
     sock.ev.on('connection.update', (update) => {
       const { connection, lastDisconnect, qr } = update;
+      if (!sessions[id]) return;
+
       if (qr) {
         sessions[id].qr = qr;
         sessions[id].ready = false;
         sessions[id].starting = false;
+        sessions[id].createdAt = Date.now();
       }
       if (connection === 'open') {
         sessions[id].ready = true;
@@ -47,17 +66,21 @@ async function startSession(id) {
         const statusCode = lastDisconnect?.error?.output?.statusCode;
         sessions[id].ready = false;
         sessions[id].starting = false;
-        if (statusCode === DisconnectReason.loggedOut) {
-          fs.rmSync(authFolder, { recursive: true, force: true });
-          delete sessions[id];
+        sessions[id].qr = null;
+        if (statusCode === DisconnectReason.loggedOut || statusCode === 401 || statusCode === 408) {
+          cleanupSession(id);
         } else {
-          setTimeout(() => startSession(id), 3000);
+          setTimeout(() => {
+            if (sessions[id]) startSession(id);
+          }, 2000);
         }
       }
     });
   } catch (err) {
-    sessions[id].error = err.message;
-    sessions[id].starting = false;
+    if (sessions[id]) {
+      sessions[id].error = err.message;
+      sessions[id].starting = false;
+    }
   }
 }
 
@@ -65,11 +88,20 @@ app.get('/', (req, res) => res.send('WA Cloud Server Running'));
 
 app.get('/qr', async (req, res) => {
   const id = (req.query.id || 'default').replace(/[^a-zA-Z0-9_-]/g, '');
-  if (!sessions[id]) {
+  if (req.query.reset === '1') {
+    cleanupSession(id);
+  }
+  if (!sessions[id] || (!sessions[id].ready && !sessions[id].qr && !sessions[id].starting)) {
     startSession(id);
   }
   const s = sessions[id] || { ready: false, qr: null };
   res.json({ ready: s.ready, qr: s.qr, error: s.error || null });
+});
+
+app.get('/logout', (req, res) => {
+  const id = (req.query.id || 'default').replace(/[^a-zA-Z0-9_-]/g, '');
+  cleanupSession(id);
+  res.json({ success: true });
 });
 
 app.post('/send-bulk', async (req, res) => {
